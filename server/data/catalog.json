@@ -1,0 +1,101 @@
+{
+  "name": "Nimbus Apps (sample)",
+  "apps": [
+    {
+      "id": "gimp",
+      "name": "GIMP",
+      "type": "deb",
+      "package": "gimp",
+      "description": "Image editor",
+      "category": "Graphics"
+    },
+    {
+      "id": "inkscape",
+      "name": "Inkscape",
+      "type": "deb",
+      "package": "inkscape",
+      "description": "Vector graphics editor",
+      "category": "Graphics"
+    },
+    {
+      "id": "krita",
+      "name": "Krita",
+      "type": "deb",
+      "package": "krita",
+      "description": "Digital painting",
+      "category": "Graphics"
+    },
+    {
+      "id": "vlc",
+      "name": "VLC media player",
+      "type": "deb",
+      "package": "vlc",
+      "description": "Plays almost any video or audio file",
+      "category": "Media"
+    },
+    {
+      "id": "audacity",
+      "name": "Audacity",
+      "type": "deb",
+      "package": "audacity",
+      "description": "Audio recorder and editor",
+      "category": "Media"
+    },
+    {
+      "id": "obs",
+      "name": "OBS Studio",
+      "type": "deb",
+      "package": "obs-studio",
+      "description": "Screen recording and streaming",
+      "category": "Media"
+    },
+    {
+      "id": "libreoffice",
+      "name": "LibreOffice",
+      "type": "deb",
+      "package": "libreoffice",
+      "description": "Word processor, spreadsheets and slides",
+      "category": "Office"
+    },
+    {
+      "id": "thunderbird",
+      "name": "Thunderbird",
+      "type": "deb",
+      "package": "thunderbird",
+      "description": "Email client",
+      "category": "Internet"
+    },
+    {
+      "id": "filezilla",
+      "name": "FileZilla",
+      "type": "deb",
+      "package": "filezilla",
+      "description": "FTP client",
+      "category": "Internet"
+    },
+    {
+      "id": "blender",
+      "name": "Blender",
+      "type": "deb",
+      "package": "blender",
+      "description": "3D creation suite",
+      "category": "Graphics"
+    },
+    {
+      "id": "geany",
+      "name": "Geany",
+      "type": "deb",
+      "package": "geany",
+      "description": "Lightweight code editor",
+      "category": "Development"
+    },
+    {
+      "id": "gnome-mines",
+      "name": "Mines",
+      "type": "deb",
+      "package": "gnome-mines",
+      "description": "Minesweeper game",
+      "category": "Games"
+    }
+  ]
+}
