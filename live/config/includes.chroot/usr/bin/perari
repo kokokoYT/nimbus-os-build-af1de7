@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Perari - the web browser for Nimbus OS (Linux edition). GTK 3 + WebKitGTK.
+
+Tabs, search-or-address bar, downloads, find in page, zoom, fullscreen. Runs JavaScript and https sites.
+Shortcuts: Ctrl+T new tab, Ctrl+W close tab, Ctrl+L address bar, Ctrl+R / F5 reload, Alt+Left / Alt+Right back / forward,
+Ctrl+Tab next tab, Ctrl+F find, Ctrl +/-/0 zoom, F11 fullscreen.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+
+# Virtual machines usually have no GPU: keep WebKit on the software path unless told otherwise.
+VM = False
+try:
+    with open("/sys/class/dmi/id/product_name") as _f:
+        VM = any(k in _f.read().lower() for k in ("virtualbox", "vmware", "qemu", "kvm", "virtual machine", "bochs"))
+except Exception:
+    pass
+if VM and not os.environ.get("PERARI_GPU"):
+    os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+    os.environ.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+try:
+    gi.require_version("WebKit2", "4.1")
+except ValueError:
+    gi.require_version("WebKit2", "4.0")
+from gi.repository import Gtk, Gdk, GLib, Gio, GdkPixbuf, WebKit2  # noqa: E402
+
+ICON = "/usr/share/perari/perari.png"
+SEARCH = "https://duckduckgo.com/?q="
+START_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>New Tab</title><style>
+:root{color-scheme:light dark} body{margin:0;font-family:Cantarell,'Helvetica Neue',sans-serif;background:linear-gradient(160deg,#dfeaff,#f3f6ff 60%%,#ffe9dc);
+min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#1d1d1f}
+@media(prefers-color-scheme:dark){body{background:linear-gradient(160deg,#1b2340,#232a4a 60%%,#3a2740);color:#f2f2f7}}
+img{width:96px;height:96px} h1{font-weight:600;letter-spacing:.5px;margin:.2em 0 .6em;font-size:2.2em}
+form{width:min(560px,86vw)} input{width:100%%;box-sizing:border-box;font-size:1.1em;padding:.8em 1.1em;border-radius:999px;border:1px solid #c9cfdd;
+background:rgba(255,255,255,.85);color:#111;outline:none} input:focus{border-color:#3478f6;box-shadow:0 0 0 3px rgba(52,120,246,.25)}
+.tiles{display:flex;gap:14px;margin-top:34px;flex-wrap:wrap;justify-content:center} .tiles a{width:104px;padding:16px 6px;text-align:center;border-radius:16px;
+background:rgba(255,255,255,.55);text-decoration:none;color:inherit;font-size:.9em;backdrop-filter:blur(6px)} .tiles a:hover{background:rgba(255,255,255,.85);color:#111}
+.tiles b{display:block;font-size:1.6em;margin-bottom:6px}
+</style></head><body><img src="perari.png" alt=""><h1>Perari</h1>
+<form action="https://duckduckgo.com/" method="get"><input name="q" placeholder="Search the web or enter an address" autofocus autocomplete="off"></form>
+<div class="tiles"><a href="https://en.wikipedia.org/"><b>W</b>Wikipedia</a><a href="https://www.youtube.com/"><b>&#9654;</b>YouTube</a>
+<a href="https://github.com/"><b>&lt;/&gt;</b>GitHub</a><a href="https://news.ycombinator.com/"><b>N</b>News</a></div></body></html>"""
+
+SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
+HOSTISH = re.compile(r"^(localhost|(\d{1,3}\.){3}\d{1,3}|[^\s/]+\.[^\s/]{2,})(:\d+)?([/?#].*)?$")
+
+
+def normalize(text):
+    """Address-bar text -> URL: keep real addresses, add https:// to host names, otherwise search."""
+    t = text.strip()
+    if not t:
+        return ""
+    if SCHEME.match(t) and not re.match(r"^[^\s/]+:\d+", t):
+        return t
+    if HOSTISH.match(t):
+        return ("http://" if t.startswith(("localhost", "127.", "192.168.", "10.")) else "https://") + t
+    return SEARCH + urllib.parse.quote_plus(t)
+
+
+def downloads_dir():
+    d = os.path.expanduser("~/Downloads")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def unique_path(name):
+    base, ext = os.path.splitext(os.path.basename(name) or "download")
+    p = os.path.join(downloads_dir(), base + ext)
+    n = 1
+    while os.path.exists(p):
+        p = os.path.join(downloads_dir(), "%s (%d)%s" % (base, n, ext)); n += 1
+    return p
+
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        try:
+            subprocess.Popen(["notify-send", "-i", "perari", title, body])
+        except Exception:
+            pass
+
+
+CSS = b"""
+.toolbar { padding: 6px 8px; background: #f2f2f5; border-bottom: 1px solid rgba(0,0,0,.14); }
+.toolbar button { border-radius: 8px; min-width: 30px; }
+.toolbar entry { border-radius: 999px; padding: 4px 14px; min-height: 26px; }
+"""
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_title("Perari")
+        self.set_default_size(1100, 720)
+        self.set_wmclass("perari", "Perari")
+        try:
+            self.set_icon(GdkPixbuf.Pixbuf.new_from_file(ICON))
+        except Exception:
+            pass
+        prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.ctx = WebKit2.WebContext.get_default()
+        try:
+            self.ctx.set_cache_model(WebKit2.CacheModel.WEB_BROWSER)
+            data = os.path.expanduser("~/.local/share/perari"); os.makedirs(data, exist_ok=True)
+            self.ctx.get_cookie_manager().set_persistent_storage(os.path.join(data, "cookies.sqlite"), WebKit2.CookiePersistentStorage.SQLITE)
+        except Exception as e:
+            print("perari: cookie storage unavailable:", e, file=sys.stderr)
+        self.ctx.connect("download-started", self.on_download)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(box)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        bar.get_style_context().add_class("toolbar")
+        box.pack_start(bar, False, False, 0)
+        self.btn_back = self.tool("go-previous-symbolic", "Back", lambda *_: self.cur() and self.cur().go_back())
+        self.btn_fwd = self.tool("go-next-symbolic", "Forward", lambda *_: self.cur() and self.cur().go_forward())
+        self.btn_reload = self.tool("view-refresh-symbolic", "Reload", self.reload_or_stop)
+        self.btn_home = self.tool("go-home-symbolic", "Home", lambda *_: self.go_home())
+        for b in (self.btn_back, self.btn_fwd, self.btn_reload, self.btn_home):
+            bar.pack_start(b, False, False, 0)
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("Search or enter address")
+        self.entry.connect("activate", self.on_enter)
+        self.entry.connect("focus-in-event", lambda e, *_: GLib.idle_add(e.select_region, 0, -1))
+        bar.pack_start(self.entry, True, True, 4)
+        newtab = self.tool("tab-new-symbolic", "New tab (Ctrl+T)", lambda *_: self.new_tab())
+        bar.pack_start(newtab, False, False, 0)
+
+        self.nb = Gtk.Notebook()
+        self.nb.set_scrollable(True)
+        self.nb.connect("switch-page", self.on_switch)
+        box.pack_start(self.nb, True, True, 0)
+
+        self.find = Gtk.SearchBar()
+        self.find_entry = Gtk.SearchEntry()
+        self.find.add(self.find_entry)
+        self.find.connect_entry(self.find_entry)
+        self.find_entry.connect("search-changed", self.on_find)
+        self.find_entry.connect("activate", lambda *_: self.cur() and self.cur().get_find_controller().search_next())
+        box.pack_end(self.find, False, False, 0)
+
+        self.connect("key-press-event", self.on_key)
+        self.show_all()
+
+    # ---------- helpers ----------
+    def tool(self, icon, tip, cb):
+        b = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.BUTTON)
+        b.set_relief(Gtk.ReliefStyle.NONE); b.set_tooltip_text(tip); b.set_focus_on_click(False)
+        b.connect("clicked", cb)
+        return b
+
+    def cur(self):
+        n = self.nb.get_current_page()
+        return self.nb.get_nth_page(n) if n >= 0 else None
+
+    def go_home(self):
+        v = self.cur()
+        if v:
+            v.load_html(START_HTML % (), "file:///usr/share/perari/")
+
+    def make_view(self, related=None):
+        v = WebKit2.WebView.new_with_related_view(related) if related is not None else WebKit2.WebView()
+        s = v.get_settings()
+        try:
+            s.set_user_agent_with_application_details("Perari", "1.0")
+            s.set_enable_smooth_scrolling(True)
+            if VM and not os.environ.get("PERARI_GPU"):
+                s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.NEVER)
+        except Exception:
+            pass
+        v.connect("notify::title", self.on_title)
+        v.connect("notify::uri", self.on_uri)
+        v.connect("notify::estimated-load-progress", self.on_progress)
+        v.connect("load-changed", self.on_load)
+        v.connect("create", self.on_create)
+        v.connect("permission-request", lambda *a: False)       # deny camera, microphone, location
+        v.connect("mouse-target-changed", self.on_hover)
+        return v
+
+    def add_tab(self, v):
+        label = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        title = Gtk.Label(label="New Tab"); title.set_ellipsize(3); title.set_max_width_chars(20); title.set_width_chars(10)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE); close.set_focus_on_click(False)
+        close.connect("clicked", lambda *_: self.close_tab(v))
+        label.pack_start(title, True, True, 0); label.pack_start(close, False, False, 0)
+        label.show_all()
+        v.perari_label = title
+        n = self.nb.append_page(v, label)
+        self.nb.set_tab_reorderable(v, True)
+        self.nb.set_show_tabs(self.nb.get_n_pages() > 1)
+        v.show()
+        return n
+
+    def new_tab(self, uri=None, focus=True):
+        v = self.make_view()
+        n = self.add_tab(v)
+        if focus:
+            self.nb.set_current_page(n)
+        if uri:
+            v.load_uri(normalize(uri) or uri)
+        else:
+            v.load_html(START_HTML % (), "file:///usr/share/perari/")
+            if focus:
+                self.entry.grab_focus()
+        return v
+
+    def close_tab(self, v):
+        n = self.nb.page_num(v)
+        if n >= 0:
+            self.nb.remove_page(n)
+        self.nb.set_show_tabs(self.nb.get_n_pages() > 1)
+        if self.nb.get_n_pages() == 0:
+            self.destroy()
+
+    def reload_or_stop(self, *_):
+        v = self.cur()
+        if v:
+            v.stop_loading() if v.is_loading() else v.reload()
+
+    # ---------- events ----------
+    def on_enter(self, entry):
+        url = normalize(entry.get_text())
+        v = self.cur()
+        if url and v:
+            v.load_uri(url); v.grab_focus()
+
+    def on_switch(self, nb, page, n):
+        self.sync(page)
+
+    def sync(self, v):
+        if v is None:
+            return
+        uri = v.get_uri() or ""
+        self.entry.set_text("" if uri.startswith("file:///usr/share/perari") or uri == "about:blank" else uri)
+        self.entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY,
+                                           "channel-secure-symbolic" if uri.startswith("https://") else "system-search-symbolic")
+        self.set_title((v.get_title() or "Perari") + (" - Perari" if v.get_title() else ""))
+        self.btn_back.set_sensitive(v.can_go_back()); self.btn_fwd.set_sensitive(v.can_go_forward())
+        self.btn_reload.set_image(Gtk.Image.new_from_icon_name("process-stop-symbolic" if v.is_loading() else "view-refresh-symbolic", Gtk.IconSize.BUTTON))
+        self.entry.set_progress_fraction(v.get_estimated_load_progress() if v.is_loading() else 0.0)
+
+    def on_title(self, v, _p):
+        t = v.get_title() or "New Tab"
+        if hasattr(v, "perari_label"):
+            v.perari_label.set_text(t)
+        if v is self.cur():
+            self.sync(v)
+
+    def on_uri(self, v, _p):
+        if v is self.cur() and not self.entry.has_focus():
+            self.sync(v)
+
+    def on_progress(self, v, _p):
+        if v is self.cur():
+            self.entry.set_progress_fraction(v.get_estimated_load_progress() if v.is_loading() else 0.0)
+
+    def on_load(self, v, event):
+        if v is self.cur():
+            self.sync(v)
+
+    def on_hover(self, v, hit, mods):
+        if v is self.cur():
+            v.set_tooltip_text(hit.get_link_uri() if hit.context_is_link() else None)
+
+    def on_create(self, v, action):
+        nv = self.make_view(related=v)
+        n = self.add_tab(nv)
+        self.nb.set_current_page(n)
+        return nv
+
+    def on_download(self, ctx, dl):
+        def decide(d, name):
+            path = unique_path(name or "download")
+            d.set_destination("file://" + urllib.parse.quote(path))
+            d.perari_path = path
+            return True
+        dl.connect("decide-destination", decide)
+        dl.connect("finished", lambda d: notify("Download finished", os.path.basename(getattr(d, "perari_path", "file"))))
+        dl.connect("failed", lambda d, e: notify("Download failed", str(e)))
+
+    def on_find(self, entry):
+        v = self.cur()
+        if v:
+            fc = v.get_find_controller()
+            if entry.get_text():
+                fc.search(entry.get_text(), WebKit2.FindOptions.CASE_INSENSITIVE | WebKit2.FindOptions.WRAP_AROUND, 200)
+            else:
+                fc.search_finish()
+
+    def on_key(self, w, ev):
+        name = Gdk.keyval_name(ev.keyval)
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(ev.state & Gdk.ModifierType.MOD1_MASK)
+        v = self.cur()
+        if ctrl and name in ("t", "T"): self.new_tab(); return True
+        if ctrl and name in ("w", "W"): v and self.close_tab(v); return True
+        if ctrl and name in ("l", "L"): self.entry.grab_focus(); return True
+        if (ctrl and name in ("r", "R")) or name == "F5": v and v.reload(); return True
+        if alt and name == "Left": v and v.go_back(); return True
+        if alt and name == "Right": v and v.go_forward(); return True
+        if ctrl and name == "Tab": self.nb.next_page(); return True
+        if ctrl and name in ("f", "F"): self.find.set_search_mode(True); self.find_entry.grab_focus(); return True
+        if ctrl and name in ("plus", "equal") and v: v.set_zoom_level(min(v.get_zoom_level() + 0.1, 3.0)); return True
+        if ctrl and name == "minus" and v: v.set_zoom_level(max(v.get_zoom_level() - 0.1, 0.3)); return True
+        if ctrl and name == "0" and v: v.set_zoom_level(1.0); return True
+        if name == "F11":
+            self.unfullscreen() if self.is_fullscreen() else self.fullscreen(); return True
+        if name == "Escape" and self.find.get_search_mode(): self.find.set_search_mode(False); return True
+        return False
+
+    def is_fullscreen(self):
+        st = self.get_window().get_state() if self.get_window() else 0
+        return bool(st & Gdk.WindowState.FULLSCREEN)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.nimbus.Perari", flags=Gio.ApplicationFlags.HANDLES_OPEN)
+
+    def window(self):
+        w = self.props.active_window
+        return w if w else Window(self)
+
+    def do_activate(self):
+        w = self.window()
+        if w.nb.get_n_pages() == 0:
+            w.new_tab()
+        w.present()
+
+    def do_open(self, files, n_files, hint):
+        w = self.window()
+        for f in files:
+            w.new_tab(f.get_uri())
+        w.present()
+
+
+def main():
+    GLib.set_prgname("perari")
+    GLib.set_application_name("Perari")
+    sys.exit(App().run(sys.argv))
+
+
+if __name__ == "__main__":
+    main()
