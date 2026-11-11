@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Nimbus dock - a floating, magnifying macOS-style dock (GTK 3 + cairo + libwnck).
+
+Apps come from ~/.config/nimbus/dock.json or /etc/nimbus/dock.json:  {"apps": ["thunar.desktop", ...]}
+"""
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+sys.path.insert(0, "/usr/lib/nimbus")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import nimbus_theme as T
+except Exception:
+    T = None
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkX11", "3.0")
+gi.require_version("Wnck", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Gio, GdkX11, Wnck  # noqa: E402,F401
+
+BASE = 48          # normal icon size
+SP = 10            # spacing
+PAD = 12           # horizontal padding inside the bar
+PAD_V = 10         # vertical padding inside the bar
+ZOOM = 1.7         # max magnification
+SIGMA = 64.0       # magnification spread (px)
+MARGIN = 8         # gap between bar and screen bottom (the "floating" part)
+BARH = BASE + 2 * PAD_V
+SEP_W = 12
+BOUNCE_T = 1.2
+
+CSS = b"#dock { background: transparent; } #dock drawingarea { background: transparent; }"
+DEFAULTS = ["perari.desktop", "thunar.desktop", "nimbus-store.desktop", "firefox-esr.desktop", "xfce4-terminal.desktop",
+            "org.xfce.mousepad.desktop", "mousepad.desktop", "xfce-settings-manager.desktop"]
+
+
+def is_dark():
+    try:
+        return bool(T.load()["dark"])
+    except Exception:
+        return False
+
+
+def load_apps():
+    for p in (os.path.expanduser("~/.config/nimbus/dock.json"), "/etc/nimbus/dock.json"):
+        try:
+            with open(p) as f:
+                return json.load(f)["apps"]
+        except Exception:
+            pass
+    return DEFAULTS
+
+
+class Item:
+    def __init__(self, kind, name="", pixbuf=None, info=None, tokens=None, cmd=None):
+        self.kind = kind            # "app", "trash", "sep"
+        self.name = name
+        self.pixbuf = pixbuf
+        self.info = info
+        self.tokens = tokens or []
+        self.cmd = cmd
+        self.bounce_start = None
+
+
+def load_pixbuf(gicon=None, name=None):
+    theme = Gtk.IconTheme.get_default()
+    try:
+        if gicon is not None:
+            info = theme.lookup_by_gicon(gicon, 128, Gtk.IconLookupFlags.FORCE_SIZE)
+            if info is not None:
+                return info.load_icon()
+        if name:
+            return theme.load_icon(name, 128, Gtk.IconLookupFlags.FORCE_SIZE)
+    except Exception:
+        pass
+    try:
+        return theme.load_icon("application-x-executable", 128, Gtk.IconLookupFlags.FORCE_SIZE)
+    except Exception:
+        return None
+
+
+def build_items():
+    items = []
+    seen = set()
+    for desktop_id in load_apps():
+        info = Gio.DesktopAppInfo.new(desktop_id)
+        if info is None or info.get_id() in seen:
+            continue
+        seen.add(info.get_id())
+        stem = desktop_id.replace(".desktop", "").lower()
+        tokens = {stem, stem.split(".")[-1]}
+        exe = info.get_executable()
+        if exe:
+            tokens.add(os.path.basename(exe).lower())
+        wm = info.get_startup_wm_class()
+        if wm:
+            tokens.add(wm.lower())
+        items.append(Item("app", info.get_display_name(), load_pixbuf(gicon=info.get_icon()), info, list(tokens)))
+    items.append(Item("sep"))
+    items.append(Item("trash", "Trash", load_pixbuf(name="user-trash"), cmd=["thunar", "trash:///"]))
+    return items
+
+
+class Dock(Gtk.Window):
+    def __init__(self):
+        super().__init__()
+        self.set_name("dock")
+        self.set_title("nimbus-dock")
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.stick()
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_app_paintable(True)
+
+        screen = Gdk.Screen.get_default()
+        visual = screen.get_rgba_visual()
+        if visual is not None and screen.is_composited():
+            self.set_visual(visual)
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        self.items = build_items()
+        self.dark = is_dark()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.reload_theme)
+        self.mx = None
+        self.hover = -1
+        self.rects = []
+        self.wscreen = Wnck.Screen.get_default()
+        self.wscreen.force_update()
+        for sig in ("window-opened", "window-closed", "active-window-changed"):
+            self.wscreen.connect(sig, lambda *_: self.da.queue_draw())
+
+        n = len(self.items)
+        self.W = int(n * (BASE + SP) + 2 * PAD + 300)
+        self.H = int(BASE * ZOOM + 2 * PAD_V + MARGIN + 48)
+        display = Gdk.Display.get_default()
+        mon = display.get_primary_monitor() or display.get_monitor(0)
+        self.geo = mon.get_geometry()
+        self.wx = self.geo.x + (self.geo.width - self.W) // 2
+        self.wy = self.geo.y + self.geo.height - self.H
+        self.set_size_request(self.W, self.H)
+        self.set_default_size(self.W, self.H)
+        self.move(self.wx, self.wy)
+
+        self.da = Gtk.DrawingArea()
+        self.da.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK |
+                           Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.da.connect("draw", self.on_draw)
+        self.da.connect("motion-notify-event", self.on_motion)
+        self.da.connect("leave-notify-event", self.on_leave)
+        self.da.connect("button-press-event", self.on_click)
+        self.add(self.da)
+        self.show_all()
+        GLib.idle_add(self.set_struts)
+        GLib.timeout_add_seconds(3, lambda: (self.da.queue_draw(), True)[1])
+
+    def reload_theme(self):
+        self.dark = is_dark()
+        self.da.queue_draw()
+        return True
+
+    def set_struts(self):
+        try:
+            xid = self.get_window().get_xid()
+            bottom = BARH + MARGIN + 6
+            x0, x1 = self.wx, self.wx + self.W - 1
+            subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT_PARTIAL", "32c", "-set",
+                            "_NET_WM_STRUT_PARTIAL", "0,0,0,%d,0,0,0,0,0,0,%d,%d" % (bottom, x0, x1)], timeout=3)
+            subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT", "32c", "-set",
+                            "_NET_WM_STRUT", "0,0,0,%d" % bottom], timeout=3)
+        except Exception as e:
+            print("nimbus-dock: strut:", e)
+        return False
+
+    # ---------- layout ----------
+    def layout(self):
+        n = len(self.items)
+        unit = BASE + SP
+        base_w = [SEP_W if it.kind == "sep" else BASE for it in self.items]
+        base_total = sum(base_w) + SP * (n - 1)
+        x = (self.W - base_total) / 2.0
+        centers = []
+        for w in base_w:
+            centers.append(x + w / 2.0)
+            x += w + SP
+        sizes = []
+        for it, c, w in zip(self.items, centers, base_w):
+            if it.kind == "sep" or self.mx is None:
+                sizes.append(float(w))
+            else:
+                d = abs(self.mx - c)
+                sizes.append(w * (1.0 + (ZOOM - 1.0) * math.exp(-((d / SIGMA) ** 2))))
+        total = sum(sizes) + SP * (n - 1)
+        x = (self.W - total) / 2.0
+        rects = []
+        for s in sizes:
+            rects.append((x, s))
+            x += s + SP
+        return rects, total
+
+    def is_running(self, it):
+        if it.kind != "app":
+            return False
+        for w in self.wscreen.get_windows():
+            if w.get_window_type() != Wnck.WindowType.NORMAL:
+                continue
+            cg = (w.get_class_group_name() or "").lower()
+            an = ""
+            app = w.get_application()
+            if app is not None:
+                an = (app.get_name() or "").lower()
+            for t in it.tokens:
+                if t and (t == cg or t == an or (cg and t in cg) or (cg and cg in t)):
+                    return True
+        return False
+
+    def find_window(self, it):
+        for w in self.wscreen.get_windows():
+            if w.get_window_type() != Wnck.WindowType.NORMAL:
+                continue
+            cg = (w.get_class_group_name() or "").lower()
+            for t in it.tokens:
+                if t and (t == cg or (cg and t in cg) or (cg and cg in t)):
+                    return w
+        return None
+
+    # ---------- drawing ----------
+    @staticmethod
+    def rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    def on_draw(self, widget, cr):
+        rects, total = self.layout()
+        self.rects = rects
+        barw = total + 2 * PAD
+        barx = (self.W - barw) / 2.0
+        bary = self.H - MARGIN - BARH
+        # glass bar
+        self.rounded(cr, barx, bary, barw, BARH, 20)
+        cr.set_source_rgba(*((0.10, 0.10, 0.13, 0.45) if self.dark else (1, 1, 1, 0.26)))
+        cr.fill_preserve()
+        cr.set_source_rgba(*((1, 1, 1, 0.22) if self.dark else (1, 1, 1, 0.55)))
+        cr.set_line_width(1.2)
+        cr.stroke()
+        now = time.time()
+        for i, (it, (x, size)) in enumerate(zip(self.items, rects)):
+            if it.kind == "sep":
+                cr.set_source_rgba(1, 1, 1, 0.45)
+                cr.rectangle(x + size / 2 - 0.5, bary + 12, 1, BARH - 24)
+                cr.fill()
+                continue
+            lift = 0.0
+            if it.bounce_start is not None:
+                t = now - it.bounce_start
+                if t > BOUNCE_T:
+                    it.bounce_start = None
+                else:
+                    lift = abs(math.sin(t * math.pi * 3)) * 20 * (1 - t / BOUNCE_T)
+            y = bary + BARH - PAD_V - size - lift
+            if it.pixbuf is not None:
+                cr.save()
+                cr.translate(x, y)
+                s = size / 128.0
+                cr.scale(s, s)
+                Gdk.cairo_set_source_pixbuf(cr, it.pixbuf, 0, 0)
+                cr.paint()
+                cr.restore()
+            if self.is_running(it):
+                cr.set_source_rgba(0.1, 0.1, 0.1, 0.8)
+                cr.arc(x + size / 2, bary + BARH - 5, 2.4, 0, 2 * math.pi)
+                cr.fill()
+        # hover label
+        if 0 <= self.hover < len(self.items) and self.items[self.hover].kind != "sep":
+            it = self.items[self.hover]
+            x, size = rects[self.hover]
+            cr.select_font_face("Sans", 0, 0)
+            cr.set_font_size(13)
+            ext = cr.text_extents(it.name)
+            lw, lh = ext.width + 20, 26
+            lx = max(4, min(self.W - lw - 4, x + size / 2 - lw / 2))
+            ly = bary - lh - 6 - (size - BASE)
+            self.rounded(cr, lx, ly, lw, lh, 8)
+            cr.set_source_rgba(0.12, 0.12, 0.14, 0.88)
+            cr.fill()
+            cr.set_source_rgba(1, 1, 1, 1)
+            cr.move_to(lx + 10, ly + 18)
+            cr.show_text(it.name)
+        return False
+
+    # ---------- events ----------
+    def hit(self, x):
+        for i, (rx, rw) in enumerate(self.rects):
+            if rx - SP / 2.0 <= x <= rx + rw + SP / 2.0:
+                return i
+        return -1
+
+    def on_motion(self, widget, ev):
+        self.mx = ev.x
+        self.hover = self.hit(ev.x)
+        self.da.queue_draw()
+        return True
+
+    def on_leave(self, widget, ev):
+        self.mx = None
+        self.hover = -1
+        self.da.queue_draw()
+        return True
+
+    def on_click(self, widget, ev):
+        i = self.hit(ev.x)
+        if i < 0 or ev.button != 1:
+            return True
+        it = self.items[i]
+        if it.kind == "sep":
+            return True
+        if it.kind == "trash":
+            subprocess.Popen(it.cmd)
+            return True
+        w = self.find_window(it)
+        if w is not None:
+            ts = Gtk.get_current_event_time()
+            if w.is_minimized():
+                w.unminimize(ts)
+            w.activate(ts)
+            return True
+        try:
+            ctx = Gdk.Display.get_default().get_app_launch_context()
+            it.info.launch([], ctx)
+        except Exception as e:
+            print("nimbus-dock: launch failed:", e)
+        it.bounce_start = time.time()
+        GLib.timeout_add(16, self.tick)
+        return True
+
+    def tick(self):
+        self.da.queue_draw()
+        now = time.time()
+        return any(it.bounce_start is not None and now - it.bounce_start < BOUNCE_T for it in self.items)
+
+
+def main():
+    Dock()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
