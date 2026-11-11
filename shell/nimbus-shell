@@ -1,0 +1,28 @@
+#!/bin/sh
+# Starts the Nimbus desktop shell: macOS-style menu bar (top) and floating dock (bottom).
+WALL=/usr/share/backgrounds/nimbus/wallpaper.png
+
+# wallpaper (xfdesktop uses one property per connected monitor)
+set_wall() {
+  for m in $(xrandr 2>/dev/null | awk '/ connected/{print $1}') 0; do
+    for p in "monitor$m" "monitor$m"; do
+      xfconf-query -c xfce4-desktop -p "/backdrop/screen0/$p/workspace0/last-image" -n -t string -s "$WALL" 2>/dev/null
+      xfconf-query -c xfce4-desktop -p "/backdrop/screen0/$p/workspace0/image-style" -n -t int -s 5 2>/dev/null
+    done
+  done
+}
+set_wall
+
+# the stock XFCE panel is not part of this session; make sure it is gone
+pkill -x xfce4-panel 2>/dev/null
+
+# menu bar: fall back to a plain XFCE panel if it cannot start
+( nimbus-menubar || xfce4-panel ) &
+
+# dock: fall back to Plank if the Nimbus dock cannot start
+( nimbus-dock || {
+    S=net.launchpad.plank.dock.settings:/net/launchpad/plank/docks/dock1/
+    gsettings set $S zoom-enabled true 2>/dev/null
+    gsettings set $S zoom-percent 160 2>/dev/null
+    plank
+  } ) &
