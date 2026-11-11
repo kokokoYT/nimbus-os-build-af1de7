@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Nimbus Shell
+Exec=nimbus-shell
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
