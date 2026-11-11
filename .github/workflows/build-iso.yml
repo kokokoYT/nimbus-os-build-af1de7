@@ -1,0 +1,39 @@
+name: Build Nimbus OS ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      lite:
+        description: "Lite build (no Wine, much smaller ISO)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Build the ISO in a Debian 12 container
+        run: |
+          LITE=""
+          if [ "${{ inputs.lite }}" = "true" ]; then LITE="1"; fi
+          sudo docker run --rm --privileged -e NIMBUS_LITE="$LITE" -v "$PWD":/work -w /work debian:bookworm \
+            bash -c "apt-get update && apt-get install -y sudo ca-certificates && bash build.sh"
+
+      - name: Show the result
+        run: ls -lh live/*.iso
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nimbus-os-linux-iso
+          path: live/*.iso
+          compression-level: 0
+          retention-days: 3
