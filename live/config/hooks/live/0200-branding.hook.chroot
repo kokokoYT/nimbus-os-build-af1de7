@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+echo "Nimbus OS" > /etc/hostname
+sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Nimbus OS (Debian based)"/' /etc/os-release || true
