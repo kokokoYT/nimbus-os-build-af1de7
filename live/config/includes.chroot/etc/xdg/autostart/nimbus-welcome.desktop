@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Welcome to Nimbus OS
+Exec=nimbus-welcome --first-run
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
