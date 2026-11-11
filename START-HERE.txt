@@ -1,0 +1,16 @@
+MAKE THE NIMBUS OS LINUX ISO WITHOUT INSTALLING ANYTHING (uses GitHub's free computers)
+
+1. Go to github.com and sign in (make a free account if needed).
+2. Click  +  (top right) > New repository. Name it nimbus-os. Choose PUBLIC. Click Create repository.
+3. On the new page click "uploading an existing file".
+4. Open this folder on your PC, press Ctrl+A to select EVERYTHING in it (including the ".github" folder),
+   and drag it all into the GitHub page. Wait until the upload finishes, then click Commit changes.
+   (If ".github" does not show in the list, upload it separately by dragging that folder alone.)
+5. Click the Actions tab. If asked, click "I understand my workflows, go ahead and enable them".
+6. Click "Build Nimbus OS ISO" on the left, then Run workflow > Run workflow.
+7. Wait about 30-60 minutes. Open the finished run (green tick) and, at the bottom, click
+   "nimbus-os-linux-iso" under Artifacts. You get a zip with the ISO inside.
+8. When you have the ISO, you can delete the repository: Settings > scroll to the bottom > Delete this repository.
+
+Tick "Lite build" in step 6 for a smaller ISO without Wine (Windows apps will not run).
+If the run fails (red cross), click it, open the failed step and send the last 20 lines to Claude.
