@@ -1,0 +1,6 @@
+#!/bin/sh
+# 32-bit Wine support (many Windows apps are 32-bit)
+set -e
+dpkg --add-architecture i386
+apt-get update
+apt-get install -y wine32:i386 || echo "wine32 not available, continuing"
