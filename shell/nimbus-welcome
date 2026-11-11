@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Welcome to Nimbus OS - first-run setup (GTK 3).
+
+Steps: welcome -> internet -> your computer (virtual machine detection) -> appearance (dark mode, accent colour) -> done.
+Run with --first-run to show it only once (used by the autostart entry).
+"""
+import os
+import re
+import subprocess
+import sys
+import threading
+
+sys.path.insert(0, "/usr/lib/nimbus")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimbus_theme as T  # noqa: E402
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf  # noqa: E402
+
+LOGO = "/usr/share/pixmaps/nimbus.png"
+
+
+def spawn(*cmd):
+    try:
+        subprocess.Popen(list(cmd))
+    except Exception as e:
+        print("nimbus-welcome:", e)
+
+
+def swatch_css():
+    rules = "".join(".swatch%d { background-image: none; background-color: %s; border-radius: 999px; min-width: 30px; min-height: 30px; "
+                    "padding: 0; border: 3px solid transparent; }\n.swatch%d.chosen { border-color: @theme_fg_color; }\n" % (i, c, i)
+                    for i, (_, c) in enumerate(T.ACCENTS))
+    return (rules + ".welcome-title { font-size: 24px; font-weight: bold; }\n.welcome-sub { opacity: 0.75; }\n"
+            ".dot-online { color: #34c759; } .dot-offline { color: #e5484d; } .dot-limited { color: #f5a623; }\n").encode()
+
+
+class Welcome(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Welcome to Nimbus OS")
+        self.set_default_size(580, 470)
+        self.set_resizable(False)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_keep_above(True)
+        self.theme = T.load()
+        self.is_vm, self.vm_name = T.detect_vm()
+        if self.is_vm:
+            self.theme["light_effects"] = True if not self.theme.get("welcome_done") else self.theme["light_effects"]
+        prov = Gtk.CssProvider(); prov.load_from_data(swatch_css())
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(outer)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(200)
+        outer.pack_start(self.stack, True, True, 0)
+        self.pages = [self.page_welcome(), self.page_internet(), self.page_computer(), self.page_look(), self.page_done()]
+        for i, p in enumerate(self.pages):
+            self.stack.add_named(p, "p%d" % i)
+        self.index = 0
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar.set_border_width(14)
+        outer.pack_end(bar, False, False, 0)
+        self.btn_skip = Gtk.Button(label="Skip")
+        self.btn_skip.connect("clicked", lambda *_: self.finish())
+        self.step = Gtk.Label(label="")
+        self.step.get_style_context().add_class("welcome-sub")
+        self.btn_back = Gtk.Button(label="Back")
+        self.btn_back.connect("clicked", lambda *_: self.go(-1))
+        self.btn_next = Gtk.Button(label="Next")
+        self.btn_next.get_style_context().add_class("suggested-action")
+        self.btn_next.connect("clicked", lambda *_: self.go(1))
+        bar.pack_start(self.btn_skip, False, False, 0)
+        bar.set_center_widget(self.step)
+        bar.pack_end(self.btn_next, False, False, 0)
+        bar.pack_end(self.btn_back, False, False, 0)
+        self.connect("destroy", self.on_destroy)
+        self.show_all()
+        self.update_nav()
+
+    # ---------- building blocks ----------
+    def box(self):
+        b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        b.set_border_width(34)
+        return b
+
+    def title(self, text):
+        l = Gtk.Label(label=text); l.get_style_context().add_class("welcome-title"); l.set_xalign(0)
+        return l
+
+    def para(self, text, sub=False):
+        l = Gtk.Label(label=text); l.set_line_wrap(True); l.set_xalign(0); l.set_max_width_chars(60)
+        if sub:
+            l.get_style_context().add_class("welcome-sub")
+        return l
+
+    # ---------- pages ----------
+    def page_welcome(self):
+        b = self.box()
+        try:
+            b.pack_start(Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_size(LOGO, 110, 110)), False, False, 6)
+        except Exception:
+            pass
+        t = self.title("Welcome to Nimbus OS"); t.set_xalign(0.5); b.pack_start(t, False, False, 0)
+        p = self.para("Let's get you set up. It only takes a minute:\n\n1.  Connect to the internet\n2.  See what kind of computer this is\n3.  Make it look the way you like", False)
+        p.set_xalign(0.5); p.set_justify(Gtk.Justification.CENTER)
+        b.pack_start(p, False, False, 6)
+        return b
+
+    def page_internet(self):
+        b = self.box()
+        b.pack_start(self.title("Connect to the internet"), False, False, 0)
+        b.pack_start(self.para("Nimbus OS needs the internet to browse with Perari, to download apps in Nimbus Store and to install updates."), False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.net_dot = Gtk.Label(label="\u25cf"); self.net_text = Gtk.Label(label="Checking...")
+        row.pack_start(self.net_dot, False, False, 0); row.pack_start(self.net_text, False, False, 0)
+        b.pack_start(row, False, False, 8)
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        again = Gtk.Button(label="Check again"); again.connect("clicked", lambda *_: self.check_net())
+        settings = Gtk.Button(label="Network settings\u2026"); settings.connect("clicked", lambda *_: spawn("nm-connection-editor"))
+        btns.pack_start(again, False, False, 0); btns.pack_start(settings, False, False, 0)
+        b.pack_start(btns, False, False, 0)
+        hint = ("You are in a virtual machine, so the internet comes from your real computer. Make sure the VM's network adapter is set to NAT (or Bridged)."
+                if self.is_vm else "On a laptop, click \"Network settings\" and pick your Wi-Fi network. A network cable connects by itself.")
+        b.pack_start(self.para(hint, True), False, False, 12)
+        return b
+
+    def page_computer(self):
+        b = self.box()
+        b.pack_start(self.title("This computer"), False, False, 0)
+        if self.is_vm:
+            b.pack_start(self.para("You are running Nimbus OS inside a virtual machine (%s)." % (self.vm_name or "unknown")), False, False, 0)
+            self.fx = Gtk.Switch(); self.fx.set_active(self.theme["light_effects"]); self.fx.set_halign(Gtk.Align.START)
+            self.fx.connect("notify::active", lambda s, _p: self.set_option("light_effects", s.get_active()))
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            row.pack_start(self.fx, False, False, 0); row.pack_start(Gtk.Label(label="Use lighter visual effects (recommended in a VM)"), False, False, 0)
+            b.pack_start(row, False, False, 10)
+            b.pack_start(self.para("Turns off window and menu shadows so everything feels smoother. Perari already switches to software drawing by itself.", True), False, False, 0)
+            b.pack_start(self.para("Tip: installing your VM's guest tools (VirtualBox Guest Additions, SPICE) gives you automatic screen resizing and a smoother mouse.", True), False, False, 10)
+        else:
+            cpu = (re.search(r"model name\s*:\s*(.+)", T.read("/proc/cpuinfo")) or [None, "Unknown processor"])[1]
+            m = re.search(r"MemTotal:\s*(\d+)", T.read("/proc/meminfo"))
+            mem = "%.1f GB" % (int(m.group(1)) / 1048576.0) if m else "?"
+            b.pack_start(self.para("You are running Nimbus OS on a physical computer."), False, False, 0)
+            b.pack_start(self.para("Processor: %s\nMemory: %s" % (cpu, mem), True), False, False, 8)
+            b.pack_start(self.para("If you start Install from the boot menu, read each screen carefully: it can erase the disk. Back up anything important first."), False, False, 8)
+        return b
+
+    def page_look(self):
+        b = self.box()
+        b.pack_start(self.title("Make it yours"), False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.dark = Gtk.Switch(); self.dark.set_active(self.theme["dark"])
+        self.dark.connect("notify::active", lambda s, _p: self.set_option("dark", s.get_active()))
+        row.pack_start(self.dark, False, False, 0); row.pack_start(Gtk.Label(label="Dark mode"), False, False, 0)
+        b.pack_start(row, False, False, 12)
+        b.pack_start(self.para("Accent color"), False, False, 0)
+        sw = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.swatches = []
+        for i, (name, color) in enumerate(T.ACCENTS):
+            btn = Gtk.Button(); btn.get_style_context().add_class("swatch%d" % i)
+            btn.set_tooltip_text(name); btn.set_focus_on_click(False)
+            btn.connect("clicked", self.on_accent, color)
+            sw.pack_start(btn, False, False, 0); self.swatches.append((btn, color))
+        b.pack_start(sw, False, False, 6)
+        self.mark_accent()
+        b.pack_start(self.para("Changes apply right away, so you can see them as you pick. You can run Welcome again any time from the logo menu.", True), False, False, 14)
+        return b
+
+    def page_done(self):
+        b = self.box()
+        t = self.title("You're all set"); t.set_xalign(0.5); b.pack_start(t, False, False, 20)
+        p = self.para("Open apps from the dock at the bottom.\nBrowse with Perari, and get more apps from Nimbus Store.\nThe logo at the top left has Settings, Force Quit and power options.")
+        p.set_xalign(0.5); p.set_justify(Gtk.Justification.CENTER)
+        b.pack_start(p, False, False, 6)
+        return b
+
+    # ---------- behaviour ----------
+    def set_option(self, key, value):
+        self.theme[key] = bool(value)
+        T.apply(self.theme)
+
+    def mark_accent(self):
+        for btn, color in self.swatches:
+            ctx = btn.get_style_context()
+            ctx.add_class("chosen") if color.lower() == self.theme["accent"].lower() else ctx.remove_class("chosen")
+
+    def on_accent(self, btn, color):
+        self.theme["accent"] = color
+        self.mark_accent()
+        T.apply(self.theme)
+
+    def check_net(self):
+        self.net_dot.set_text("\u25cf"); self.net_text.set_text("Checking...")
+        for c in ("dot-online", "dot-offline", "dot-limited"):
+            self.net_dot.get_style_context().remove_class(c)
+        def work():
+            state = T.internet_state()
+            GLib.idle_add(self.show_net, state)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_net(self, state):
+        text, cls = {"online": ("You are online.", "dot-online"), "limited": ("Connected, but the internet is not reachable yet (a sign-in page may be needed).", "dot-limited"),
+                     "offline": ("Not connected.", "dot-offline"), "unknown": ("Could not check (NetworkManager is not answering).", "dot-limited")}[state]
+        self.net_text.set_text(text)
+        self.net_dot.get_style_context().add_class(cls)
+        return False
+
+    def update_nav(self):
+        n = len(self.pages)
+        self.stack.set_visible_child_name("p%d" % self.index)
+        self.step.set_text("Step %d of %d" % (self.index + 1, n))
+        self.btn_back.set_sensitive(self.index > 0)
+        self.btn_next.set_label("Done" if self.index == n - 1 else ("Get started" if self.index == 0 else "Next"))
+        self.btn_skip.set_visible(self.index < n - 1)
+        if self.index == 1:
+            self.check_net()
+
+    def go(self, d):
+        n = self.index + d
+        if n >= len(self.pages):
+            self.finish(); return
+        self.index = max(0, n)
+        self.update_nav()
+
+    def finish(self):
+        self.theme["welcome_done"] = True
+        T.save(self.theme)
+        self.destroy()
+
+    def on_destroy(self, *_):
+        self.theme["welcome_done"] = True
+        T.save(self.theme)
+        Gtk.main_quit()
+
+
+def main():
+    if "--first-run" in sys.argv and T.load().get("welcome_done"):
+        return
+    Welcome()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
