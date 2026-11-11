@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Nimbus Store
+Comment=Install Debian and Windows apps
+Exec=nimbus-store
+Icon=nimbus
+Categories=System;PackageManager;
