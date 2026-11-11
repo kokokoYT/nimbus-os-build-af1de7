@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Nimbus Store - installs Debian packages and Windows apps (via Wine) from a catalog server."""
+import hashlib, json, os, re, shutil, subprocess, sys, threading, urllib.parse, urllib.request
+
+APP_DIR = os.path.expanduser("~/.local/share/nimbus/apps")
+CACHE = os.path.expanduser("~/.cache/nimbus-store")
+STATE = os.path.expanduser("~/.config/nimbus/installed.json")
+DRY = bool(os.environ.get("NIMBUS_DRY_RUN"))
+PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]+$")
+HELPER = "/usr/lib/nimbus/apt-helper"
+
+
+def server_url():
+    if os.environ.get("NIMBUS_SERVER"):
+        return os.environ["NIMBUS_SERVER"].rstrip("/")
+    for p in (os.path.expanduser("~/.config/nimbus/store.json"), "/etc/nimbus/store.json"):
+        try:
+            return json.load(open(p))["server"].rstrip("/")
+        except Exception:
+            pass
+    return "http://localhost:8080"
+
+
+def fetch_catalog():
+    with urllib.request.urlopen(server_url() + "/catalog.json", timeout=15) as r:
+        data = json.load(r)
+    apps = []
+    for a in data.get("apps", []):
+        try:
+            assert a["id"] and a["name"] and a["type"] in ("deb", "windows")
+            if a["type"] == "deb":
+                assert PKG_RE.match(a["package"])
+            else:
+                assert re.fullmatch(r"[0-9a-fA-F]{64}", a["sha256"]) and a["url"]
+            apps.append(a)
+        except Exception:
+            print("skipping invalid catalog entry:", a.get("id"), file=sys.stderr)
+    return apps
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {}
+
+
+def save_state(s):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(s, open(STATE, "w"), indent=1)
+
+
+def run(cmd, log=print):
+    log("$ " + " ".join(cmd))
+    if DRY:
+        log("(dry run - not executed)")
+        return 0
+    return subprocess.call(cmd)
+
+
+def deb_installed(pkg):
+    try:
+        out = subprocess.run(["dpkg-query", "-W", "-f=${Status}", pkg], capture_output=True, text=True).stdout
+        return "install ok installed" in out
+    except Exception:
+        return False
+
+
+def is_installed(a):
+    if a["type"] == "deb":
+        return deb_installed(a["package"])
+    return a["id"] in load_state()
+
+
+def download(a, log=print, progress=None):
+    url = urllib.parse.urljoin(server_url() + "/", a["url"])
+    os.makedirs(CACHE, exist_ok=True)
+    name = os.path.basename(urllib.parse.urlparse(url).path) or a["id"] + ".exe"
+    dest = os.path.join(CACHE, name)
+    log("Downloading " + url)
+    h = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=30) as r, open(dest + ".part", "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        while True:
+            b = r.read(65536)
+            if not b:
+                break
+            f.write(b); h.update(b); got += len(b)
+            if progress and total:
+                progress(got * 100 // total)
+    if h.hexdigest().lower() != a["sha256"].lower():
+        os.remove(dest + ".part")
+        raise RuntimeError("Checksum mismatch - download rejected")
+    os.replace(dest + ".part", dest)
+    log("Checksum OK")
+    return dest
+
+
+def install(a, log=print, progress=None):
+    if a["type"] == "deb":
+        return run(["pkexec", HELPER, "install", a["package"]], log) == 0
+    path = download(a, log, progress)
+    if a.get("portable"):
+        d = os.path.join(APP_DIR, a["id"])
+        os.makedirs(d, exist_ok=True)
+        target = os.path.join(d, os.path.basename(path))
+        shutil.copy(path, target)
+        launch_path = target
+    else:
+        args = a.get("installer_args", "").split()
+        if run(["wine", path] + args, log) != 0:
+            return False
+        launch_path = a.get("launch", "")
+    st = load_state()
+    st[a["id"]] = {"version": a.get("version", ""), "launch": launch_path, "portable": bool(a.get("portable"))}
+    save_state(st)
+    return True
+
+
+def launch(a, log=print):
+    if a["type"] == "deb":
+        exe = a.get("command") or a["package"]
+        if DRY:
+            log("DRY: " + exe)
+        else:
+            subprocess.Popen([exe])
+        return
+    info = load_state().get(a["id"])
+    if not info or not info["launch"]:
+        log("No launch path recorded; use the Wine menu.")
+        return
+    cmd = ["wine", info["launch"]]
+    if DRY:
+        log("DRY: " + " ".join(cmd))
+    else:
+        subprocess.Popen(cmd)
+
+
+def remove(a, log=print):
+    if a["type"] == "deb":
+        return run(["pkexec", HELPER, "remove", a["package"]], log) == 0
+    st = load_state()
+    info = st.get(a["id"], {})
+    if info.get("portable"):
+        shutil.rmtree(os.path.join(APP_DIR, a["id"]), ignore_errors=True)
+    else:
+        run(["wine", "uninstaller"], log)
+    st.pop(a["id"], None)
+    save_state(st)
+    return True
+
+
+def find(apps, key):
+    for a in apps:
+        if a["id"] == key:
+            return a
+    raise SystemExit("No such app: " + key)
+
+
+def cli(argv):
+    apps = fetch_catalog()
+    cmd = argv[0]
+    if cmd in ("list", "search"):
+        q = argv[1].lower() if len(argv) > 1 else ""
+        for a in apps:
+            if q in (a["name"] + a.get("description", "") + a["id"]).lower():
+                print("%-14s %-8s %-9s %s" % (a["id"], a["type"], "installed" if is_installed(a) else "-", a["name"]))
+    elif cmd == "install":
+        sys.exit(0 if install(find(apps, argv[1])) else 1)
+    elif cmd == "remove":
+        sys.exit(0 if remove(find(apps, argv[1])) else 1)
+    elif cmd == "launch":
+        launch(find(apps, argv[1]))
+    else:
+        print("usage: nimbus-store [list|search Q|install ID|remove ID|launch ID]")
+
+
+def gui():
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    root = tk.Tk(className="nimbus-store")
+    root.title("Nimbus Store")
+    root.geometry("820x520")
+    top = ttk.Frame(root); top.pack(fill="x", padx=8, pady=6)
+    ttk.Label(top, text="Nimbus Store", font=("sans", 16, "bold")).pack(side="left")
+    q = tk.StringVar()
+    ttk.Entry(top, textvariable=q, width=28).pack(side="right")
+    ttk.Label(top, text="Search:").pack(side="right", padx=4)
+    mid = ttk.Frame(root); mid.pack(fill="both", expand=True, padx=8)
+    tree = ttk.Treeview(mid, columns=("name", "type", "cat", "status"), show="headings", height=14)
+    for c, w, t in (("name", 260, "App"), ("type", 120, "Source"), ("cat", 140, "Category"), ("status", 100, "Status")):
+        tree.heading(c, text=t); tree.column(c, width=w)
+    tree.pack(side="left", fill="both", expand=True)
+    sb = ttk.Scrollbar(mid, command=tree.yview); sb.pack(side="right", fill="y")
+    tree.configure(yscrollcommand=sb.set)
+    desc = tk.Label(root, text="", anchor="w", justify="left", wraplength=780); desc.pack(fill="x", padx=8, pady=4)
+    btns = ttk.Frame(root); btns.pack(fill="x", padx=8)
+    bar = ttk.Progressbar(root, maximum=100); bar.pack(fill="x", padx=8, pady=4)
+    status = tk.StringVar(value="Server: " + server_url())
+    ttk.Label(root, textvariable=status).pack(fill="x", padx=8, pady=(0, 6))
+    apps = []
+
+    def refresh(*_):
+        tree.delete(*tree.get_children())
+        for a in apps:
+            if q.get().lower() in (a["name"] + a.get("description", "")).lower():
+                tree.insert("", "end", iid=a["id"], values=(
+                    a["name"], "Debian" if a["type"] == "deb" else "Windows (Wine)",
+                    a.get("category", ""), "Installed" if is_installed(a) else ""))
+
+    def load():
+        try:
+            apps[:] = fetch_catalog()
+            root.after(0, refresh)
+        except Exception as e:
+            root.after(0, lambda: status.set("Cannot reach server: %s" % e))
+
+    def sel():
+        s = tree.selection()
+        return find(apps, s[0]) if s else None
+
+    def on_select(_):
+        a = sel()
+        if a:
+            desc.config(text="%s %s - %s" % (a["name"], a.get("version", ""), a.get("description", "")))
+
+    def work(fn, label):
+        a = sel()
+        if not a:
+            return
+        say = lambda m: root.after(0, lambda: status.set(str(m)[:110]))
+        prog = lambda p: root.after(0, lambda: bar.config(value=p))
+
+        def t():
+            try:
+                root.after(0, lambda: status.set(label + " " + a["name"] + "..."))
+                ok = fn(a, say, prog) if fn is install else fn(a, say)
+                root.after(0, lambda: (status.set("Done" if ok is not False else "Failed"), bar.config(value=0), refresh()))
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Nimbus Store", str(e)))
+        threading.Thread(target=t, daemon=True).start()
+
+    def do_launch():
+        a = sel()
+        if a:
+            launch(a, lambda m: status.set(str(m)[:110]))
+
+    ttk.Button(btns, text="Install", command=lambda: work(install, "Installing")).pack(side="left", padx=2)
+    ttk.Button(btns, text="Launch", command=do_launch).pack(side="left", padx=2)
+    ttk.Button(btns, text="Remove", command=lambda: work(remove, "Removing")).pack(side="left", padx=2)
+    ttk.Button(btns, text="Refresh", command=lambda: threading.Thread(target=load, daemon=True).start()).pack(side="right")
+    tree.bind("<<TreeviewSelect>>", on_select)
+    q.trace_add("write", refresh)
+    threading.Thread(target=load, daemon=True).start()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        cli(sys.argv[1:])
+    else:
+        gui()
