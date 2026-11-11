@@ -1,0 +1,6 @@
+#!/bin/sh
+# make Perari the default web browser for links opened from other programs
+set -e
+update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/perari 300 || true
+update-alternatives --set x-www-browser /usr/bin/perari || true
+update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/bin/perari 300 || true
