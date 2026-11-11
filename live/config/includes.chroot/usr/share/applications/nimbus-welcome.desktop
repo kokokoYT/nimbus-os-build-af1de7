@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Welcome to Nimbus OS
+Comment=Set up the internet, check your computer and choose your look
+Exec=nimbus-welcome
+Icon=nimbus
+Categories=System;Settings;
