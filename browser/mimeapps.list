@@ -1,0 +1,5 @@
+[Default Applications]
+x-scheme-handler/http=perari.desktop
+x-scheme-handler/https=perari.desktop
+text/html=perari.desktop
+application/xhtml+xml=perari.desktop
