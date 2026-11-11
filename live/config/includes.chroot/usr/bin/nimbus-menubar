@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""Nimbus menu bar - a macOS-style top bar for Nimbus OS (GTK 3 + libwnck).
+
+Left : logo menu (About, Settings, Store, Force Quit, power), active app name, File/Edit/View/Window/Help.
+Right: Spotlight search, Wi-Fi, volume, battery, clock/calendar.
+"""
+import glob
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+signal.signal(signal.SIGUSR1, signal.SIG_IGN)      # a theme-reload signal must never kill the bar while it starts
+sys.path.insert(0, "/usr/lib/nimbus")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import nimbus_theme as T
+except Exception:
+    T = None
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkX11", "3.0")
+gi.require_version("Wnck", "3.0")
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, GdkX11, Wnck  # noqa: E402,F401
+
+BAR_H = 28
+LOGO = "/usr/share/pixmaps/nimbus.png"
+def load_theme():
+    try:
+        return T.load()
+    except Exception:
+        return {"dark": False, "accent": "#3478f6"}
+
+
+def make_css(theme):
+    if theme.get("dark"):
+        bar, fg, hover, edge = "rgba(30,30,34,0.80)", "#f2f2f7", "rgba(255,255,255,0.18)", "rgba(255,255,255,0.12)"
+    else:
+        bar, fg, hover, edge = "rgba(246,246,248,0.80)", "#1d1d1f", "rgba(0,0,0,0.12)", "rgba(0,0,0,0.12)"
+    return ("""
+#bar { background-color: %(bar)s; border-bottom: 1px solid %(edge)s; }
+#bar menubar { background: transparent; border: none; box-shadow: none; padding: 0; }
+#bar menubar > menuitem { padding: 0 10px; min-height: 26px; border-radius: 5px; color: %(fg)s; font-size: 13px; }
+#bar menubar > menuitem:hover { background-color: %(hover)s; }
+#bar button { background: transparent; border: none; box-shadow: none; padding: 0 8px; min-height: 24px;
+              border-radius: 5px; color: %(fg)s; font-size: 13px; }
+#bar button:hover { background-color: %(hover)s; }
+#bar label { color: %(fg)s; font-size: 13px; }
+""" % {"bar": bar, "edge": edge, "fg": fg, "hover": hover}).encode()
+
+
+def spawn(*cmd):
+    try:
+        subprocess.Popen(list(cmd))
+    except Exception as e:
+        print("nimbus-menubar:", e)
+
+
+def out(cmd, timeout=2):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def menu_item(label, cb=None, sensitive=True):
+    item = Gtk.MenuItem(label=label)
+    if cb:
+        item.connect("activate", lambda *_: cb())
+    item.set_sensitive(sensitive)
+    return item
+
+
+def clear(container):
+    for c in container.get_children():
+        container.remove(c)
+
+
+class Bar(Gtk.Window):
+    def __init__(self):
+        super().__init__()
+        self.set_name("bar")
+        self.set_title("nimbus-menubar")
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.stick()
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_app_paintable(True)
+
+        screen = Gdk.Screen.get_default()
+        visual = screen.get_rgba_visual()
+        if visual is not None and screen.is_composited():
+            self.set_visual(visual)
+        self.prov = Gtk.CssProvider()
+        self.prov.load_from_data(make_css(load_theme()))
+        Gtk.StyleContext.add_provider_for_screen(screen, self.prov, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.reload_theme)
+
+        display = Gdk.Display.get_default()
+        mon = display.get_primary_monitor() or display.get_monitor(0)
+        self.geo = mon.get_geometry()
+        self.set_size_request(self.geo.width, BAR_H)
+        self.set_default_size(self.geo.width, BAR_H)
+        self.move(self.geo.x, self.geo.y)
+
+        self.wscreen = Wnck.Screen.get_default()
+        self.wscreen.force_update()
+
+        root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.add(root)
+        self.menubar = Gtk.MenuBar()
+        root.pack_start(self.menubar, False, False, 6)
+        self.right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        root.pack_end(self.right, False, False, 8)
+
+        self.build_left()
+        self.build_right()
+
+        self.wscreen.connect("active-window-changed", lambda *_: self.refresh_app())
+        self.wscreen.connect("window-opened", lambda *_: self.refresh_app())
+        self.wscreen.connect("window-closed", lambda *_: self.refresh_app())
+        self.refresh_app()
+
+        GLib.timeout_add_seconds(10, self.update_status)
+        self.update_status()
+        self.show_all()
+        GLib.idle_add(self.set_struts)
+
+    def reload_theme(self):
+        self.prov.load_from_data(make_css(load_theme()))
+        return True
+
+    # ---------- window / struts ----------
+    def set_struts(self):
+        try:
+            xid = self.get_window().get_xid()
+            g = self.geo
+            x1 = g.x + g.width - 1
+            subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT_PARTIAL", "32c", "-set",
+                            "_NET_WM_STRUT_PARTIAL", "0,0,%d,0,0,0,0,0,%d,%d,0,0" % (BAR_H, g.x, x1)], timeout=3)
+            subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT", "32c", "-set",
+                            "_NET_WM_STRUT", "0,0,%d,0" % BAR_H], timeout=3)
+        except Exception as e:
+            print("nimbus-menubar: strut:", e)
+        return False
+
+    # ---------- helpers on the active window ----------
+    def active(self):
+        w = self.wscreen.get_active_window()
+        if w is None:
+            return None
+        if w.get_window_type() in (Wnck.WindowType.NORMAL, Wnck.WindowType.DIALOG):
+            return w
+        return None
+
+    def app_name(self, w):
+        if w is None:
+            return "Desktop"
+        app = w.get_application()
+        name = app.get_name() if app is not None else w.get_name()
+        return (name or "Desktop")[:26]
+
+    def send_keys(self, combo):
+        def go():
+            spawn("xdotool", "key", "--clearmodifiers", combo)
+            return False
+        GLib.timeout_add(250, go)
+
+    def user_windows(self):
+        return [w for w in self.wscreen.get_windows()
+                if w.get_window_type() in (Wnck.WindowType.NORMAL, Wnck.WindowType.DIALOG)
+                and not w.is_skip_tasklist()]
+
+    # ---------- left side ----------
+    def build_left(self):
+        # logo / "Apple" menu
+        self.logo_item = Gtk.MenuItem()
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(LOGO, 18, 18)
+            self.logo_item.add(Gtk.Image.new_from_pixbuf(pb))
+        except Exception:
+            self.logo_item.add(Gtk.Label(label="Nimbus"))
+        m = Gtk.Menu()
+        m.append(menu_item("About Nimbus OS", self.show_about))
+        m.append(menu_item("Welcome to Nimbus OS\u2026", lambda: spawn("nimbus-welcome")))
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(menu_item("System Settings\u2026", lambda: spawn("xfce4-settings-manager")))
+        m.append(menu_item("Nimbus Store\u2026", lambda: spawn("nimbus-store")))
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(menu_item("Force Quit\u2026", self.force_quit))
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(menu_item("Sleep", lambda: spawn("xfce4-session-logout", "--suspend", "--fast")))
+        m.append(menu_item("Restart\u2026", lambda: self.confirm("Restart", "Are you sure you want to restart?",
+                                                                "xfce4-session-logout", "--reboot", "--fast")))
+        m.append(menu_item("Shut Down\u2026", lambda: self.confirm("Shut Down", "Are you sure you want to shut down?",
+                                                                  "xfce4-session-logout", "--halt", "--fast")))
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(menu_item("Log Out\u2026", lambda: self.confirm("Log Out", "Are you sure you want to log out?",
+                                                                "xfce4-session-logout", "--logout", "--fast")))
+        self.logo_item.set_submenu(m)
+        self.menubar.append(self.logo_item)
+
+        # active application name (bold)
+        self.app_item = Gtk.MenuItem()
+        self.app_label = Gtk.Label()
+        self.app_item.add(self.app_label)
+        self.app_menu = Gtk.Menu()
+        self.app_item.set_submenu(self.app_menu)
+        self.menubar.append(self.app_item)
+
+        # File
+        fm = Gtk.Menu()
+        fm.append(menu_item("New Window", lambda: self.send_keys("ctrl+n")))
+        fm.append(menu_item("New Tab", lambda: self.send_keys("ctrl+t")))
+        fm.append(Gtk.SeparatorMenuItem())
+        fm.append(menu_item("Close Window", self.close_window))
+        self.add_top("File", fm)
+
+        # Edit
+        em = Gtk.Menu()
+        for entry in (("Undo", "ctrl+z"), ("Redo", "ctrl+shift+z"), None,
+                      ("Cut", "ctrl+x"), ("Copy", "ctrl+c"), ("Paste", "ctrl+v"), None,
+                      ("Select All", "ctrl+a")):
+            if entry is None:
+                em.append(Gtk.SeparatorMenuItem())
+            else:
+                em.append(menu_item(entry[0], lambda c=entry[1]: self.send_keys(c)))
+        self.add_top("Edit", em)
+
+        # View
+        vm = Gtk.Menu()
+        vm.append(menu_item("Enter Full Screen", self.toggle_fullscreen))
+        vm.append(menu_item("Zoom In", lambda: self.send_keys("ctrl+plus")))
+        vm.append(menu_item("Zoom Out", lambda: self.send_keys("ctrl+minus")))
+        self.add_top("View", vm)
+
+        # Window (rebuilt dynamically)
+        self.window_menu = Gtk.Menu()
+        self.add_top("Window", self.window_menu)
+
+        # Help
+        hm = Gtk.Menu()
+        hm.append(menu_item("Nimbus OS Help", self.show_help))
+        hm.append(menu_item("Welcome to Nimbus OS", lambda: spawn("nimbus-welcome")))
+        hm.append(menu_item("About Nimbus OS", self.show_about))
+        self.add_top("Help", hm)
+
+    def add_top(self, label, submenu):
+        item = Gtk.MenuItem(label=label)
+        item.set_submenu(submenu)
+        self.menubar.append(item)
+        return item
+
+    def refresh_app(self):
+        w = self.active()
+        name = self.app_name(w)
+        self.app_label.set_markup("<b>%s</b>" % GLib.markup_escape_text(name))
+        clear(self.app_menu)
+        self.app_menu.append(menu_item("Hide %s" % name, self.hide_app, w is not None))
+        self.app_menu.append(Gtk.SeparatorMenuItem())
+        self.app_menu.append(menu_item("Quit %s" % name, self.close_window, w is not None))
+        self.app_menu.show_all()
+
+        clear(self.window_menu)
+        self.window_menu.append(menu_item("Minimize", self.minimize_window, w is not None))
+        self.window_menu.append(menu_item("Zoom", self.zoom_window, w is not None))
+        self.window_menu.append(menu_item("Close Window", self.close_window, w is not None))
+        wins = self.user_windows()
+        if wins:
+            self.window_menu.append(Gtk.SeparatorMenuItem())
+        for win in wins:
+            title = (win.get_name() or "Untitled")[:40]
+            self.window_menu.append(menu_item(title, lambda x=win: x.activate(Gtk.get_current_event_time())))
+        self.window_menu.show_all()
+
+    # ---------- window actions ----------
+    def close_window(self):
+        w = self.active()
+        if w is not None:
+            w.close(Gtk.get_current_event_time())
+
+    def minimize_window(self):
+        w = self.active()
+        if w is not None:
+            w.minimize()
+
+    def zoom_window(self):
+        w = self.active()
+        if w is not None:
+            if w.is_maximized():
+                w.unmaximize()
+            else:
+                w.maximize()
+
+    def toggle_fullscreen(self):
+        w = self.active()
+        if w is not None:
+            w.set_fullscreen(not w.is_fullscreen())
+
+    def hide_app(self):
+        w = self.active()
+        if w is None:
+            return
+        app = w.get_application()
+        for x in self.user_windows():
+            if x.get_application() == app:
+                x.minimize()
+
+    # ---------- dialogs ----------
+    def confirm(self, title, text, *cmd):
+        d = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text=text)
+        d.set_title(title)
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        d.add_button(title, Gtk.ResponseType.OK)
+        d.set_keep_above(True)
+        r = d.run()
+        d.destroy()
+        if r == Gtk.ResponseType.OK:
+            spawn(*cmd)
+
+    def show_about(self):
+        d = Gtk.Dialog(title="About Nimbus OS")
+        d.set_resizable(False)
+        d.set_keep_above(True)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(24)
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(LOGO, 112, 112)
+            box.pack_start(Gtk.Image.new_from_pixbuf(pb), False, False, 4)
+        except Exception:
+            pass
+        title = Gtk.Label()
+        title.set_markup("<span size='xx-large' weight='bold'>Nimbus OS</span>")
+        box.pack_start(title, False, False, 0)
+        deb = read("/etc/debian_version", "?")
+        box.pack_start(Gtk.Label(label="Version 1.0  \u2022  built on Debian %s" % deb), False, False, 0)
+        cpu = "Unknown"
+        m = re.search(r"model name\s*:\s*(.+)", read("/proc/cpuinfo"))
+        if m:
+            cpu = m.group(1)
+        mem = "?"
+        m = re.search(r"MemTotal:\s*(\d+)", read("/proc/meminfo"))
+        if m:
+            mem = "%.1f GB" % (int(m.group(1)) / 1048576.0)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=4)
+        grid.set_margin_top(14)
+        rows = (("Processor", cpu), ("Memory", mem), ("Kernel", out(["uname", "-r"]).strip()),
+                ("Created by", "Claude, an AI assistant from Anthropic"), ("TikTok", "Hello Moto"))
+        for i, (k, v) in enumerate(rows):
+            a = Gtk.Label(label=k, xalign=1)
+            a.set_sensitive(False)
+            grid.attach(a, 0, i, 1, 1)
+            grid.attach(Gtk.Label(label=v, xalign=0), 1, i, 1, 1)
+        box.pack_start(grid, False, False, 0)
+        d.add_button("OK", Gtk.ResponseType.OK)
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    def show_help(self):
+        d = Gtk.MessageDialog(transient_for=None, flags=0, message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.OK, text="Welcome to Nimbus OS")
+        d.format_secondary_text("\u2022 Open apps from the dock at the bottom.\n"
+                                "\u2022 Get more apps from Nimbus Store (Debian and Windows apps).\n"
+                                "\u2022 Click the logo at the top left for Settings, Force Quit and power options.\n"
+                                "\u2022 Click the magnifier at the top right to search for apps and files.")
+        d.set_keep_above(True)
+        d.run()
+        d.destroy()
+
+    def force_quit(self):
+        d = Gtk.Dialog(title="Force Quit Applications")
+        d.set_keep_above(True)
+        d.set_default_size(360, 300)
+        store = Gtk.ListStore(str, int)
+        for w in self.user_windows():
+            store.append([(w.get_name() or "Untitled")[:50], w.get_pid()])
+        tree = Gtk.TreeView(model=store)
+        tree.append_column(Gtk.TreeViewColumn("Open windows", Gtk.CellRendererText(), text=0))
+        sc = Gtk.ScrolledWindow()
+        sc.add(tree)
+        d.get_content_area().pack_start(sc, True, True, 0)
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        d.add_button("Force Quit", Gtk.ResponseType.OK)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK:
+            model, it = tree.get_selection().get_selected()
+            if it is not None:
+                pid = model[it][1]
+                if pid > 1:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception as e:
+                        print("force quit:", e)
+        d.destroy()
+
+    # ---------- right side ----------
+    def flat_button(self, icon=None, label=None):
+        b = Gtk.Button()
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.set_focus_on_click(False)
+        if icon:
+            b.add(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
+        else:
+            b.add(Gtk.Label(label=label))
+        return b
+
+    def build_right(self):
+        # Spotlight
+        spot = self.flat_button("system-search-symbolic")
+        spot.set_tooltip_text("Search")
+        spot.connect("clicked", lambda *_: spawn("xfce4-appfinder", "--collapsed"))
+        self.right.pack_start(spot, False, False, 0)
+
+        # Wi-Fi
+        self.wifi = self.flat_button("network-wireless-symbolic")
+        self.wifi.connect("clicked", self.wifi_menu)
+        self.right.pack_start(self.wifi, False, False, 0)
+        self.ssid = ""
+
+        # Volume
+        self.vol = self.flat_button("audio-volume-high-symbolic")
+        self.vol_pop = Gtk.Popover.new(self.vol)
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vb.set_border_width(10)
+        vb.pack_start(Gtk.Label(label="Sound"), False, False, 0)
+        self.vol_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.vol_scale.set_size_request(200, -1)
+        self.vol_scale.set_draw_value(False)
+        self.vol_scale.connect("value-changed", self.on_volume)
+        vb.pack_start(self.vol_scale, False, False, 0)
+        mute = Gtk.Button(label="Mute / Unmute")
+        mute.connect("clicked", lambda *_: spawn("pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"))
+        vb.pack_start(mute, False, False, 0)
+        more = Gtk.Button(label="Sound Settings\u2026")
+        more.connect("clicked", lambda *_: spawn("pavucontrol"))
+        vb.pack_start(more, False, False, 0)
+        vb.show_all()
+        self.vol_pop.add(vb)
+        self.vol.connect("clicked", self.open_volume)
+        self.right.pack_start(self.vol, False, False, 0)
+
+        # Battery (hidden when none)
+        self.batt = Gtk.Label(label="")
+        self.batt.set_margin_start(6)
+        self.batt.set_margin_end(6)
+        self.right.pack_start(self.batt, False, False, 0)
+
+        # Clock + calendar
+        self.clock = Gtk.Button(label="")
+        self.clock.set_relief(Gtk.ReliefStyle.NONE)
+        self.clock.set_focus_on_click(False)
+        self.cal_pop = Gtk.Popover.new(self.clock)
+        cal = Gtk.Calendar()
+        cal.set_border_width(8)
+        cal.show()
+        self.cal_pop.add(cal)
+        self.clock.connect("clicked", lambda *_: self.cal_pop.popup())
+        self.right.pack_start(self.clock, False, False, 0)
+
+    def open_volume(self, *_):
+        text = out(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+        m = re.search(r"(\d+)%", text)
+        self.updating_vol = True
+        if m:
+            self.vol_scale.set_value(min(int(m.group(1)), 100))
+        self.updating_vol = False
+        self.vol_pop.popup()
+
+    def on_volume(self, scale):
+        if getattr(self, "updating_vol", False):
+            return
+        spawn("pactl", "set-sink-volume", "@DEFAULT_SINK@", "%d%%" % int(scale.get_value()))
+
+    def wifi_menu(self, btn):
+        m = Gtk.Menu()
+        m.append(menu_item("Wi-Fi: %s" % (self.ssid or "Not connected"), None, False))
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(menu_item("Network Settings\u2026", lambda: spawn("nm-connection-editor")))
+        m.show_all()
+        m.popup_at_widget(btn, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+
+    def update_status(self):
+        self.clock.set_label(time.strftime("%a %b %-d   %-I:%M %p"))
+        bats = glob.glob("/sys/class/power_supply/BAT*")
+        if bats:
+            cap = read(bats[0] + "/capacity", "?")
+            charging = read(bats[0] + "/status") == "Charging"
+            self.batt.set_text("%s%%%s" % (cap, " \u26a1" if charging else ""))
+            self.batt.show()
+        else:
+            self.batt.hide()
+        ssid = ""
+        for line in out(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"]).splitlines():
+            if line.startswith("yes:"):
+                ssid = line[4:]
+                break
+        self.ssid = ssid
+        self.wifi.set_tooltip_text(ssid or "Wi-Fi")
+        return True
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    Bar()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
