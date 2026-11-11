@@ -1,0 +1,12 @@
+{
+ "apps": [
+  "perari.desktop",
+  "thunar.desktop",
+  "nimbus-store.desktop",
+  "xfce4-terminal.desktop",
+  "org.xfce.mousepad.desktop",
+  "mousepad.desktop",
+  "firefox-esr.desktop",
+  "xfce-settings-manager.desktop"
+ ]
+}
