@@ -1,0 +1,11 @@
+#!/bin/sh
+# Privileged helper used by Nimbus Store (run via pkexec).
+set -e
+action="$1"; pkg="$2"
+case "$pkg" in ""|*[!a-z0-9+.-]*) echo "invalid package name" >&2; exit 2;; esac
+export DEBIAN_FRONTEND=noninteractive
+case "$action" in
+  install) apt-get update -qq; apt-get install -y -- "$pkg" ;;
+  remove)  apt-get remove -y -- "$pkg" ;;
+  *) echo "usage: apt-helper install|remove PACKAGE" >&2; exit 2 ;;
+esac
